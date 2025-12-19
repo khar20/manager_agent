@@ -3,8 +3,8 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -24,7 +24,6 @@ app = FastAPI(title="Postgres AI Agent")
 def execute_sql_query(query: str):
     """
     Executes a raw SQL query against the database.
-    Handles SELECT (returns JSON) and INSERT/UPDATE/DELETE (returns success message).
     """
     conn = None
     try:
@@ -32,8 +31,6 @@ def execute_sql_query(query: str):
         conn.autocommit = True
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query)
-            
-            # If the query is a SELECT, fetch results
             if cur.description:
                 result = cur.fetchall()
                 return json.dumps(result, default=str)
@@ -52,7 +49,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "run_database_query",
-            "description": "Execute a generic SQL query to GET, ADD, or UPDATE data based on the user request. Always write complete SQL.",
+            "description": "Execute a generic SQL query to GET, ADD, or UPDATE data based on the user request.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -77,7 +74,7 @@ task_priority_type: 'High', 'Medium', 'Low'
 task_status_type: 'To Do', 'In Progress', 'Review', 'Done'
 asset_status_type: 'In Stock', 'In Use', 'Maintenance', 'Missing', 'Retired'
 
--- TABLES (Simplified for context)
+-- TABLES
 users (id, email, full_name, user_role, is_active)
 clients (id, name, contact_email, phone)
 assets (id, asset_name, serial_number, location, purchase_value, asset_status)
@@ -100,23 +97,31 @@ def get_system_prompt():
     {DB_SCHEMA}
     
     Instructions:
-    1. You have ONE tool: 'run_database_query'. Use it for EVERYTHING (Fetching clients, adding projects, updating tasks, etc.).
+    1. You have ONE tool: 'run_database_query'. Use it for EVERYTHING.
     2. Convert the user's natural language request into a specific PostgreSQL query.
     3. Always select relevant columns to show the user what happened.
-    4. If adding data, ensure you handle foreign keys (like client_id) correctly. If you don't know an ID, you might need to query it first or ask, but try to infer if possible.
+    4. If adding data, handle foreign keys appropriately.
     5. Be concise in your final response.
     """
 
-# --- 4. API ENDPOINT ---
+# --- 4. API ENDPOINT (UPDATED FOR GO COMPATIBILITY) ---
 
 class AgentRequest(BaseModel):
-    message: str
+    query: str = Field(alias="query") 
+    
+    session_id: str | None = Field(default=None, alias="session_id") 
+
+    class Config:
+        populate_by_name = True
 
 @app.post("/agent")
 async def run_agent(request: AgentRequest):
+    # Log the incoming query for debugging (visible in Easypanel logs)
+    print(f"Received Query: {request.query} | Session: {request.session_id}")
+
     messages = [
         {"role": "system", "content": get_system_prompt()},
-        {"role": "user", "content": request.message}
+        {"role": "user", "content": request.query} # Use 'query' from the request
     ]
 
     # First call to LLM
@@ -134,15 +139,12 @@ async def run_agent(request: AgentRequest):
     if response_message.tool_calls:
         for tool_call in response_message.tool_calls:
             if tool_call.function.name == "run_database_query":
-                # Extract arguments
                 args = json.loads(tool_call.function.arguments)
                 sql_query = args.get("query")
                 
-                # Execute SQL
-                print(f"Executing SQL: {sql_query}") # Log for debug
+                print(f"Executing SQL: {sql_query}")
                 tool_output = execute_sql_query(sql_query)
                 
-                # Provide result back to LLM
                 messages.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
@@ -150,7 +152,7 @@ async def run_agent(request: AgentRequest):
                     "content": tool_output
                 })
 
-        # Second call to LLM to generate natural language response based on DB result
+        # Second call to LLM
         final_response = client.chat.completions.create(
             model=MODEL,
             messages=messages
@@ -158,7 +160,3 @@ async def run_agent(request: AgentRequest):
         return {"response": final_response.choices[0].message.content}
     
     return {"response": response_message.content}
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
