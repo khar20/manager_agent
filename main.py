@@ -14,12 +14,12 @@ load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL = "gpt-4o"
+MODEL = "gpt-5"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Postgres AI Agent")
+app = FastAPI(title="Project Management Agent")
 
-# --- 1. DATABASE UTILS ---
+# DATABASE UTILS
 
 def execute_sql_query(query: str):
     """
@@ -42,14 +42,17 @@ def execute_sql_query(query: str):
         if conn:
             conn.close()
 
-# --- 2. AGENT TOOLS DEFINITION ---
+# AGENT TOOLS DEFINITION
 
 tools = [
+    {
+        "type": "web_search"
+    },
     {
         "type": "function",
         "function": {
             "name": "run_database_query",
-            "description": "Execute a generic SQL query to GET, ADD, or UPDATE data based on the user request.",
+            "description": "Execute a generic SQL query to GET, ADD, or UPDATE data in the local Postgres database.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -64,7 +67,7 @@ tools = [
     }
 ]
 
-# --- 3. SYSTEM PROMPT & SCHEMA ---
+# SYSTEM PROMPT & SCHEMA
 
 DB_SCHEMA = """
 -- ENUMS
@@ -88,8 +91,7 @@ def get_system_prompt():
     formatted_date = now.strftime("%A, %B %d, %Y at %I:%M %p")
     
     return f"""
-    Role: You are an assistant agent. Your goal is to facilitate the management tasks of the users. 
-    Don't ask me for input before executing a task, execute the task via SQL and show me the result for validation.
+    Role: You are an assistant agent with access to the project management database and the Internet.
     
     Current date: {formatted_date}
     
@@ -97,18 +99,16 @@ def get_system_prompt():
     {DB_SCHEMA}
     
     Instructions:
-    1. You have ONE tool: 'run_database_query'. Use it for EVERYTHING.
-    2. Convert the user's natural language request into a specific PostgreSQL query.
-    3. Always select relevant columns to show the user what happened.
-    4. If adding data, handle foreign keys appropriately.
-    5. Be concise in your final response.
+    1. Use 'run_database_query' for internal data (Projects, Clients, Tasks).
+    2. Use 'web_search' (built-in) to find outside information (Market rates, Tech news, Competitors).
+    3. You can combine them (e.g., "Find the exchange rate for USD to EUR and update the project budget").
+    4. Always show the user the result of your actions.
     """
 
-# --- 4. API ENDPOINT (UPDATED FOR GO COMPATIBILITY) ---
+# API ENDPOINT
 
 class AgentRequest(BaseModel):
     query: str = Field(alias="query") 
-    
     session_id: str | None = Field(default=None, alias="session_id") 
 
     class Config:
@@ -116,47 +116,47 @@ class AgentRequest(BaseModel):
 
 @app.post("/agent")
 async def run_agent(request: AgentRequest):
-    # Log the incoming query for debugging (visible in Easypanel logs)
-    print(f"Received Query: {request.query} | Session: {request.session_id}")
+    print(f"Received Query: {request.query}")
 
+    # conversation with system prompt + user query
     messages = [
         {"role": "system", "content": get_system_prompt()},
-        {"role": "user", "content": request.query} # Use 'query' from the request
+        {"role": "user", "content": request.query}
     ]
 
-    # First call to LLM
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=MODEL,
-        messages=messages,
-        tools=tools,
-        tool_choice="auto"
+        input=messages,
+        tools=tools
     )
 
-    response_message = response.choices[0].message
-    messages.append(response_message)
-
-    # Check if the agent wants to run a SQL query
-    if response_message.tool_calls:
-        for tool_call in response_message.tool_calls:
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        for tool_call in response.tool_calls:
             if tool_call.function.name == "run_database_query":
+                # Execute the SQL
                 args = json.loads(tool_call.function.arguments)
                 sql_query = args.get("query")
-                
                 print(f"Executing SQL: {sql_query}")
+                
                 tool_output = execute_sql_query(sql_query)
                 
+                # Append result to history
                 messages.append({
-                    "tool_call_id": tool_call.id,
+                    "role": "assistant",
+                    "tool_calls": [tool_call] # Pass the original tool call object
+                })
+                messages.append({
                     "role": "tool",
-                    "name": "run_database_query",
+                    "tool_call_id": tool_call.id,
                     "content": tool_output
                 })
 
-        # Second call to LLM
-        final_response = client.chat.completions.create(
+        # Generate final answer
+        final_response = client.responses.create(
             model=MODEL,
-            messages=messages
+            input=messages,
+            tools=tools
         )
-        return {"response": final_response.choices[0].message.content}
-    
-    return {"response": response_message.content}
+        return {"response": final_response.output_text}
+
+    return {"response": response.output_text}
