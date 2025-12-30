@@ -3,18 +3,18 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional, Any
+from typing import Optional
 
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
-# --- CONFIGURATION & LOGGING ---
+# CONFIGURATION
 
 load_dotenv()
 
@@ -23,68 +23,56 @@ logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL = "gpt-5"
+MODEL = "gpt-4o"
 
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set")
+    raise ValueError("DATABASE_URL must be set")
 
 aclient = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# --- DATABASE CONNECTION POOL ---
+# DATABASE LAYER
 
 class DatabasePool:
     _pool = None
 
     @classmethod
     def initialize(cls):
-        try:
-            cls._pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=20,
-                dsn=DATABASE_URL
-            )
-            logger.info("Database connection pool initialized.")
-        except Exception as e:
-            logger.error(f"Failed to initialize database pool: {e}")
-            raise
+        cls._pool = psycopg2.pool.ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
+        logger.info("Database pool initialized")
 
     @classmethod
     def close(cls):
         if cls._pool:
             cls._pool.closeall()
-            logger.info("Database connection pool closed.")
+            logger.info("Database pool closed")
 
     @classmethod
     def get_conn(cls):
-        if not cls._pool:
-            raise Exception("Database pool not initialized")
         return cls._pool.getconn()
 
     @classmethod
     def put_conn(cls, conn):
-        if cls._pool:
-            cls._pool.putconn(conn)
+        cls._pool.putconn(conn)
 
 def execute_sql_query_sync(query: str) -> str:
     conn = None
     try:
         conn = DatabasePool.get_conn()
-        conn.autocommit = True 
+        conn.autocommit = True
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query)
             if cur.description:
                 result = cur.fetchall()
                 return json.dumps(result, default=str)
-            else:
-                return json.dumps({"status": "success", "message": "Query executed successfully."})
+            return json.dumps({"status": "success", "message": "Query executed successfully."})
     except Exception as e:
-        logger.error(f"SQL Execution Error: {e}")
+        logger.error(f"SQL Error: {e}")
         return json.dumps({"status": "error", "error": str(e)})
     finally:
         if conn:
             DatabasePool.put_conn(conn)
 
-# --- LIFESPAN MANAGER ---
+# APP LIFECYCLE
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,7 +82,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# --- TOOLS DEFINITION ---
+# SCHEMA & PROMPTS
 
 tools = [
     {
@@ -116,8 +104,6 @@ tools = [
         }
     }
 ]
-
-# --- PROMPTS & SCHEMAS ---
 
 DB_SCHEMA = """
 user_role_type: 'Admin', 'Manager', 'Employee'
@@ -147,25 +133,24 @@ def get_instructions():
     3. Always return a final response to the user.
     """
 
-# --- API ENDPOINTS ---
+# API ENDPOINT
 
 class AgentRequest(BaseModel):
-    query: str = Field(alias="query") 
-    session_id: Optional[str] = Field(default=None, alias="session_id") 
+    query: str = Field(alias="query")
+    session_id: Optional[str] = Field(default=None, alias="session_id")
 
     class Config:
         populate_by_name = True
 
 @app.post("/agent")
 async def run_agent(request: AgentRequest):
-    logger.info(f"Received agent request: {request.query}")
+    logger.info(f"Received query: {request.query}")
     
     conversation_input = [
         {"role": "user", "content": request.query}
     ]
 
     while True:
-        # Async call to OpenAI
         response = await aclient.responses.create(
             model=MODEL,
             instructions=get_instructions(),
@@ -178,7 +163,6 @@ async def run_agent(request: AgentRequest):
         if not function_calls:
             return {"response": response.output_text}
 
-        # Update history with assistant's decision
         for item in response.output:
             if item.type == "message":
                 conversation_input.append({"role": "assistant", "content": item.content})
@@ -187,20 +171,17 @@ async def run_agent(request: AgentRequest):
                     "type": "function_call",
                     "call_id": item.call_id,
                     "function": {
-                        "name": item.function.name,
-                        "arguments": item.function.arguments
+                        "name": item.name, 
+                        "arguments": item.arguments
                     }
                 })
 
-        # Execute tools
         for call in function_calls:
-            if call.function.name == "run_database_query":
-                args = json.loads(call.function.arguments)
+            if call.name == "run_database_query":
+                args = json.loads(call.arguments)
                 sql_query = args.get("query")
                 
                 logger.info(f"Executing SQL: {sql_query}")
-                
-                # Run blocking DB call in thread pool to prevent blocking event loop
                 result = await run_in_threadpool(execute_sql_query_sync, sql_query)
                 
                 conversation_input.append({
