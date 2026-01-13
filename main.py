@@ -10,7 +10,7 @@ from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MODEL = "gpt-5"
+MODEL = "gpt-5-mini"
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable is not set")
@@ -209,11 +209,10 @@ def get_instructions():
 # API ENDPOINTS
 
 class AgentRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     query: str = Field(alias="query")
     session_id: Optional[str] = Field(default=None, alias="session_id")
-
-    class Config:
-        populate_by_name = True
 
 @app.post("/agent")
 async def run_agent(request: AgentRequest):
@@ -284,6 +283,7 @@ async def run_agent(request: AgentRequest):
                 output_item = {
                     "type": "function_call_output",
                     "call_id": call.call_id,
+                    "name": call.name, 
                     "output": result
                 }
                 conversation_input.append(output_item)
