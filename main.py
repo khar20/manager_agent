@@ -223,6 +223,17 @@ async def run_agent(request: AgentRequest):
     if request.session_id:
         conversation_input = await run_in_threadpool(get_history_sync, request.session_id)
     
+    call_id_map = {}
+    for item in conversation_input:
+        if item.get("type") == "function_call":
+            call_id_map[item.get("call_id")] = item.get("function", {}).get("name")
+    
+    for item in conversation_input:
+        if item.get("type") == "function_call_output" and "name" not in item:
+            # Try to find name from the map, default to 'run_database_query' if not found
+            found_name = call_id_map.get(item.get("call_id"), "run_database_query")
+            item["name"] = found_name
+    
     # Add Current User Message
     user_item = {"role": "user", "content": request.query}
     conversation_input.append(user_item)
